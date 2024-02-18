@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
+	"sync"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/gorilla/mux"
@@ -34,33 +36,78 @@ type NpmPackageVersion struct {
 	Dependencies map[string]*NpmPackageVersion `json:"dependencies"`
 }
 
+var PackageCache []*NpmPackageVersion
+var mtx sync.Mutex
+
+func GetPackageFromCache(name string, version string) *NpmPackageVersion {
+	mtx.Lock()
+	defer mtx.Unlock()
+
+	for i := range PackageCache {
+		if PackageCache[i].Name == name && PackageCache[i].Version == version {
+			log.Printf("found in cache! name: %v, version: %v \n", name, version)
+			return PackageCache[i]
+		}
+	}
+
+	return nil
+}
+
+func AddPackageToCache(pkg *NpmPackageVersion) {
+	mtx.Lock()
+	defer mtx.Unlock()
+	PackageCache = append(PackageCache, pkg)
+	log.Printf("putting object to cache. name: %v, version: %v \n", pkg.Name, pkg.Version)
+}
+
 func packageHandler(w http.ResponseWriter, r *http.Request) {
+	var wg sync.WaitGroup
 	vars := mux.Vars(r)
 	pkgName := vars["package"]
 	pkgVersion := vars["version"]
 
-	rootPkg := &NpmPackageVersion{Name: pkgName, Dependencies: map[string]*NpmPackageVersion{}}
-	if err := resolveDependencies(rootPkg, pkgVersion); err != nil {
-		println(err.Error())
-		w.WriteHeader(500)
-		return
+	cachepkg := GetPackageFromCache(pkgName, pkgVersion)
+	if cachepkg == nil {
+		wg.Add(1)
+		rootPkg := &NpmPackageVersion{Name: pkgName, Dependencies: map[string]*NpmPackageVersion{}}
+
+		resolveDependencies(rootPkg, pkgVersion, &wg)
+		wg.Wait()
+
+		AddPackageToCache(rootPkg)
+
+		stringified, err := json.MarshalIndent(rootPkg, "", "  ")
+		if err != nil {
+			println(err.Error())
+			w.WriteHeader(500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+
+		// Ignoring ResponseWriter errors
+		_, _ = w.Write(stringified)
+
+	} else {
+		stringified, err := json.MarshalIndent(cachepkg, "", "  ")
+		if err != nil {
+			println(err.Error())
+			w.WriteHeader(500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+
+		// Ignoring ResponseWriter errors
+		_, _ = w.Write(stringified)
 	}
 
-	stringified, err := json.MarshalIndent(rootPkg, "", "  ")
-	if err != nil {
-		println(err.Error())
-		w.WriteHeader(500)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-
-	// Ignoring ResponseWriter errors
-	_, _ = w.Write(stringified)
 }
 
-func resolveDependencies(pkg *NpmPackageVersion, versionConstraint string) error {
+func resolveDependencies(pkg *NpmPackageVersion, versionConstraint string, wg *sync.WaitGroup) error {
+	defer wg.Done()
 	pkgMeta, err := fetchPackageMeta(pkg.Name)
 	if err != nil {
 		return err
@@ -76,11 +123,10 @@ func resolveDependencies(pkg *NpmPackageVersion, versionConstraint string) error
 		return err
 	}
 	for dependencyName, dependencyVersionConstraint := range npmPkg.Dependencies {
+		wg.Add(1)
 		dep := &NpmPackageVersion{Name: dependencyName, Dependencies: map[string]*NpmPackageVersion{}}
 		pkg.Dependencies[dependencyName] = dep
-		if err := resolveDependencies(dep, dependencyVersionConstraint); err != nil {
-			return err
-		}
+		go resolveDependencies(dep, dependencyVersionConstraint, wg)
 	}
 	return nil
 }
